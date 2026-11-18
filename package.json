@@ -1,0 +1,41 @@
+{
+  "name": "ytfx",
+  "version": "1.0.0",
+  "description": "YouTube Discord embed proxy service",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "vitest tests/e2e.test.js --reporter=verbose",
+    "test:e2e:skip": "echo 'E2E tests are skipped by default. Edit tests/e2e.test.js to enable.'",
+    "postinstall": "npm run setup-ytdlp",
+    "setup-ytdlp": "echo 'yt-dlp will be installed via pip on Railway'"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.0.0",
+    "sql.js": "^1.8.0",
+    "youtube-dl-exec": "^2.2.2"
+  },
+  "devDependencies": {
+    "cheerio": "^1.2.0",
+    "puppeteer": "^24.37.5",
+    "sharp": "^0.35.4",
+    "supertest": "^7.0.0",
+    "vitest": "^2.0.0"
+  },
+  "keywords": [
+    "youtube",
+    "discord",
+    "embed",
+    "proxy"
+  ],
+  "author": "",
+  "license": "MIT"
+}

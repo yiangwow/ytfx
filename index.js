@@ -1,0 +1,1163 @@
+import express from 'express';
+import youtubeDlExec from 'youtube-dl-exec';
+import fs from 'fs';
+import path from 'path';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
+import rateLimit from 'express-rate-limit';
+import { initDb, logRequest, getStats } from './db.js';
+import { CUTE_EMOTICONS } from './emoticons.js';
+import { recordOperation, getMetricsSummary, getOperationHistory } from './metrics.js';
+import { store as duelRooms, RoomError } from './mhstats-rooms.js';
+import { store as quizRooms, QuizError } from './mhstats-quiz.js';
+import { execSync } from 'child_process';
+import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
+
+// Load .env file for local development
+if (process.env.NODE_ENV !== 'production' && fs.existsSync('.env')) {
+  const envContent = fs.readFileSync('.env', 'utf-8');
+  envContent.split('\n').forEach(line => {
+    const [key, ...valueParts] = line.split('=');
+    if (key && !key.startsWith('#') && key.trim()) {
+      process.env[key.trim()] = valueParts.join('=').trim();
+    }
+  });
+}
+
+const app = express();
+
+// Get current git commit hash for version tracking
+let COMMIT_HASH = 'unknown';
+try {
+  COMMIT_HASH = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim();
+} catch (error) {
+  try {
+    // Fallback: read from .git/HEAD if git command fails
+    const gitDir = path.join(process.cwd(), '.git');
+    if (fs.existsSync(gitDir)) {
+      const headContent = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim();
+      if (headContent.startsWith('ref:')) {
+        const refPath = headContent.split(' ')[1];
+        COMMIT_HASH = fs.readFileSync(path.join(gitDir, refPath), 'utf-8').trim().slice(0, 7);
+      }
+    }
+  } catch (e) {
+    console.log('[Warning] Could not determine git commit hash');
+  }
+}
+console.log(`[Server] ytfx commit: ${COMMIT_HASH}`);
+
+// Trust proxy for accurate IP detection behind reverse proxy (Render, Caddy, etc.)
+app.set('trust proxy', 1);
+
+// The MH Stats page, its modules, its stylesheet and its deck all change together on a
+// deploy, because they are one thing. Cached independently, a browser ends up holding new
+// markup against an old stylesheet — which is exactly what shipped a completely unstyled
+// quiz: quiz.js was a new file so it fetched, style.css was not so it did not.
+//
+// Asking for revalidation does not work. Sending `Cache-Control: no-cache` was tried and
+// measured against production: Cloudflare passed it through for index.html but replaced it
+// with its own `max-age=14400` on .css and .js, which are precisely the files that break the
+// page. `must-revalidate` does not rescue that — inside max-age the copy is still fresh, so
+// the browser never asks.
+//
+// So the URL changes instead, which no cache anywhere can argue with. Everything is also
+// served under a /v-<hash>/ prefix, and index.html points at it. Relative ES imports resolve
+// against the importing module's own URL, so app.js importing './quiz.js' picks up the
+// versioned copy for free, with no build step and no import rewriting.
+const MHSTATS_DIR = 'public/mhstats';
+
+// The hash covers every file that has to move together. Anything here changing gives the
+// whole bundle a new URL.
+const MHSTATS_V = (() => {
+  const hash = createHash('sha256');
+  for (const f of ['index.html', 'app.js', 'quiz.js', 'game.js', 'storage.js', 'style.css', 'deck.json']) {
+    try { hash.update(readFileSync(`${MHSTATS_DIR}/${f}`)); } catch { /* not fatal: a missing file simply does not version */ }
+  }
+  return hash.digest('hex').slice(0, 10);
+})();
+
+// Any version prefix serves the current files. An older prefix therefore still resolves
+// rather than 404ing at a client mid-session across a deploy, and it stays self-consistent
+// because the whole bundle moves together. Immutable: a given URL's content never changes,
+// since changing it is what produces a new URL.
+app.use(/^\/mhstats\/v-[0-9a-f]{6,}/, express.static(MHSTATS_DIR, {
+  maxAge: '365d',
+  immutable: true,
+}));
+
+// index.html is rewritten once at boot to point at the versioned prefix, and is the one
+// thing served fresh — it is 1.7kB, and Cloudflare was measured passing `no-cache` through
+// for it. Registered before the plain /mhstats mount so it wins for the page itself.
+const MHSTATS_HTML = readFileSync(`${MHSTATS_DIR}/index.html`, 'utf8')
+  .replace(/\.\/(style\.css|app\.js)/g, `./v-${MHSTATS_V}/$1`);
+
+app.get(['/mhstats', '/mhstats/', '/mhstats/index.html'], (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  res.type('html').send(MHSTATS_HTML);
+});
+
+// Everything else under /mhstats/ — the 14MB of renders, credits.txt, and the unversioned
+// paths older links may still use. Renders keep the default cache: one never changes once
+// written, and re-fetching them every deploy is the expensive mistake in the other direction.
+app.use('/mhstats', express.static(MHSTATS_DIR));
+
+// Serve static files from public directory
+app.use(express.static('public'));
+
+// Serve downloaded videos (will be set after VIDEOS_DIR is defined)
+
+// Get credentials from env vars
+const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES;
+const YOUTUBE_COOKIES_B64 = process.env.YOUTUBE_COOKIES_B64;
+const PORT = process.env.PORT || 3000;
+
+// Write cookies to temporary file if provided
+// Priority: YOUTUBE_COOKIES_B64 (base64-encoded Netscape file) > YOUTUBE_COOKIES (semicolon string)
+let COOKIES_FILE = null;
+if (YOUTUBE_COOKIES_B64) {
+  // Preferred: base64-encoded Netscape cookie file (preserves all metadata)
+  COOKIES_FILE = path.join('/tmp', 'youtube_cookies.txt');
+  const decoded = Buffer.from(YOUTUBE_COOKIES_B64, 'base64').toString('utf-8');
+  fs.writeFileSync(COOKIES_FILE, decoded);
+  const lineCount = decoded.split('\n').filter(l => l && !l.startsWith('#')).length;
+  console.log(`[Cookies] ENABLED (base64 Netscape) - ${lineCount} cookies written to ${COOKIES_FILE}`);
+  console.log(`[Cookies] File size: ${fs.statSync(COOKIES_FILE).size} bytes`);
+} else if (YOUTUBE_COOKIES) {
+  // Legacy: semicolon-separated cookie string → convert to Netscape format
+  COOKIES_FILE = path.join('/tmp', 'youtube_cookies.txt');
+  const netscapeContent = parseCookieString(YOUTUBE_COOKIES);
+  fs.writeFileSync(COOKIES_FILE, netscapeContent);
+  console.log(`[Cookies] ENABLED (string) - Wrote ${YOUTUBE_COOKIES.split(';').length} cookies to ${COOKIES_FILE}`);
+  console.log(`[Cookies] File size: ${fs.statSync(COOKIES_FILE).size} bytes`);
+} else {
+  console.log(`[Cookies] DISABLED - No YOUTUBE_COOKIES or YOUTUBE_COOKIES_B64 env var found`);
+}
+
+// Videos download directory (use /tmp on Render, /data on home server)
+const VIDEOS_DIR = process.env.VIDEOS_DIR || '/tmp/ytfx_videos';
+try {
+  fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+  console.log(`[Videos] Directory ready: ${VIDEOS_DIR}`);
+} catch (e) {
+  console.warn(`[Videos] Could not create ${VIDEOS_DIR}: ${e.message}`);
+}
+
+// Now that VIDEOS_DIR is set, add the static route
+app.use('/videos', express.static(VIDEOS_DIR));
+
+// In-memory cache for video data with TTL
+const cache = new Map();
+const CACHE_TTL = 2 * 60 * 60 * 1000; // 2 hours (increased from 30 min for performance)
+const CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const THUMBNAIL_PROBE_BYTES = 64 * 1024;
+const THUMBNAIL_PROBE_TIMEOUT = 750;
+
+// Track in-progress stream extraction to deduplicate concurrent proxy requests.
+const pendingExtractions = new Map(); // cacheKey → Promise<stream data>
+
+// Rate limiter: 60 requests/minute per IP
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // 60 requests per windowMs
+  handler: (req, res) => res.status(429).json({ error: 'Rate limit exceeded. Max 60 requests/minute.' }),
+  skip: (req) => {
+    // Skip rate limiting for health and stats endpoints
+    return req.path === '/health' || req.path === '/stats';
+  },
+  // Use X-Forwarded-For for accurate IP detection behind proxy
+  keyGenerator: (req) => {
+    return req.ip; // Express will use X-Forwarded-For since trust proxy is set
+  },
+});
+
+// Analytics middleware
+function analyticsMiddleware(req, res, next) {
+  const startTime = Date.now();
+
+  // Capture original send
+  const originalSend = res.send;
+  res.send = function(data) {
+    const responseMs = Date.now() - startTime;
+    const videoId = req.videoId || null;
+    const type = req.routeType || null;
+    const success = res.statusCode >= 200 && res.statusCode < 400 ? 1 : 0;
+
+    logRequest(req, videoId, type, success, responseMs);
+
+    originalSend.call(this, data);
+  };
+
+  next();
+}
+
+// Check if request is from Discord bot
+function isDiscordBot(req) {
+  const userAgent = req.get('user-agent') || '';
+  return userAgent.toLowerCase().includes('discordbot');
+}
+
+// Extract video ID from various YouTube URL formats
+function extractVideoId(req, type) {
+  let videoId;
+
+  if (type === 'watch') {
+    videoId = req.query.v;
+  } else if (type === 'shorts') {
+    videoId = req.params.id;
+  } else if (type === 'short-form') {
+    videoId = req.params.id;
+  }
+
+  // Strip query parameters if accidentally included (e.g., ?si=...)
+  if (videoId && videoId.includes('?')) {
+    videoId = videoId.split('?')[0];
+  }
+
+  // Validate: alphanumeric + dash + underscore only
+  if (!videoId || !/^[a-zA-Z0-9_-]+$/.test(videoId)) {
+    return null;
+  }
+
+  return videoId;
+}
+
+// Fetch oEmbed metadata from YouTube
+async function fetchOEmbed(videoId) {
+  const startTime = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+  try {
+    const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+    const response = await fetch(url, { signal: controller.signal });
+
+    if (!response.ok) {
+      throw new Error(`oEmbed HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    const duration = Date.now() - startTime;
+    recordOperation('oEmbed', duration, { videoId, status: 'success' });
+    return data;
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    recordOperation('oEmbed', duration, { videoId, status: 'error', error: error.message });
+    console.error(`[Error] fetchOEmbed for ${videoId}:`, error.message);
+    // Return minimal fallback data
+    return { title: 'YouTube Video' };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseJpegDimensions(bytes) {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return null;
+  }
+
+  const startOfFrameMarkers = new Set([
+    0xc0, 0xc1, 0xc2, 0xc3,
+    0xc5, 0xc6, 0xc7,
+    0xc9, 0xca, 0xcb,
+    0xcd, 0xce, 0xcf,
+  ]);
+  let offset = 2;
+
+  while (offset < bytes.length) {
+    while (offset < bytes.length && bytes[offset] !== 0xff) offset += 1;
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    if (offset >= bytes.length) return null;
+
+    const marker = bytes[offset];
+    offset += 1;
+
+    // Standalone markers have no segment length.
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) continue;
+    if (offset + 1 >= bytes.length) return null;
+
+    const segmentLength = (bytes[offset] << 8) | bytes[offset + 1];
+    if (segmentLength < 2) return null;
+
+    if (startOfFrameMarkers.has(marker)) {
+      if (offset + 6 >= bytes.length || segmentLength < 7) return null;
+      const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
+      const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+
+    if (offset + segmentLength > bytes.length) return null;
+    offset += segmentLength;
+  }
+
+  return null;
+}
+
+async function readJpegDimensions(body) {
+  const reader = body.getReader();
+  let prefix = new Uint8Array(0);
+
+  try {
+    while (prefix.length < THUMBNAIL_PROBE_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const remaining = THUMBNAIL_PROBE_BYTES - prefix.length;
+      const chunk = value.subarray(0, remaining);
+      const combined = new Uint8Array(prefix.length + chunk.length);
+      combined.set(prefix);
+      combined.set(chunk, prefix.length);
+      prefix = combined;
+
+      const dimensions = parseJpegDimensions(prefix);
+      if (dimensions) {
+        await reader.cancel().catch(() => {});
+        return dimensions;
+      }
+    }
+
+    await reader.cancel().catch(() => {});
+    return parseJpegDimensions(prefix);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function fetchThumbnailDimensions(thumbnailUrl, videoId) {
+  const startTime = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), THUMBNAIL_PROBE_TIMEOUT);
+
+  try {
+    const response = await fetch(thumbnailUrl, {
+      headers: { Range: `bytes=0-${THUMBNAIL_PROBE_BYTES - 1}` },
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`thumbnail HTTP ${response.status}`);
+    }
+
+    const dimensions = await readJpegDimensions(response.body);
+    if (!dimensions) {
+      throw new Error('thumbnail dimensions unavailable');
+    }
+
+    recordOperation('thumbnail-probe', Date.now() - startTime, { videoId, status: 'success' });
+    return dimensions;
+  } catch (error) {
+    recordOperation('thumbnail-probe', Date.now() - startTime, {
+      videoId,
+      status: 'error',
+      error: error.message,
+    });
+    console.error(`[Error] fetchThumbnailDimensions for ${videoId}:`, error.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Metadata must stay independent from yt-dlp so crawler responses have bounded latency.
+async function fetchEmbedMetadata(videoId, isShorts = false) {
+  const primaryThumbnail = isShorts
+    ? `https://i.ytimg.com/vi/${videoId}/oar2.jpg`
+    : `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+  const [oembedData, thumbnailDimensions] = await Promise.all([
+    fetchOEmbed(videoId),
+    isShorts
+      ? fetchThumbnailDimensions(primaryThumbnail, videoId)
+      : Promise.resolve({ width: 1280, height: 720 }),
+  ]);
+
+  return {
+    title: oembedData.title || 'YouTube Video',
+    thumbnail: primaryThumbnail,
+    landscapeThumbnail: isShorts ? `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg` : null,
+    width: thumbnailDimensions?.width ?? null,
+    height: thumbnailDimensions?.height ?? null,
+    isShorts,
+  };
+}
+
+// Fetch stream URL using yt-dlp
+// Get video info (stream URL + dimensions) from yt-dlp - called only once
+// Timeout wrapper for yt-dlp execution (max 2 seconds)
+async function executeWithTimeout(promise, timeoutMs = 2000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
+}
+
+async function getVideoInfo(videoId, isShorts = false) {
+  const startTime = Date.now();
+  try {
+    const url = isShorts
+      ? `https://www.youtube.com/shorts/${videoId}`
+      : `https://www.youtube.com/watch?v=${videoId}`;
+
+    // Optimized options: minimal extraction for speed (2-3x faster)
+    const options = {
+      dumpJson: true, // Required: return parsed JSON with url, formats, dimensions (ADR-002)
+      format: '18', // mimetypes=video/mp4 - fastest format selection (ADR-008)
+      quiet: true,
+      skipDownload: true, // Don't download - just extract metadata
+      noPlaylist: true, // Skip playlist detection
+      noProgress: true, // Don't show progress bar
+      jsRuntimes: 'node', // Required: JavaScript runtime for YouTube extraction (ADR-003)
+      remoteComponents: 'ejs:github', // Required: External JS solver for n-parameter challenge (ADR-001)
+    };
+
+    // Add cookies if available
+    if (COOKIES_FILE) {
+      options.cookies = COOKIES_FILE;
+    }
+
+    // Execute with 30-second timeout (EJS solver + n-parameter challenge can take 10-15s on first run)
+    const result = await executeWithTimeout(
+      youtubeDlExec(url, options),
+      30000
+    );
+
+    // Extract stream URL
+    let streamUrl = null;
+    if (result.url) {
+      streamUrl = result.url;
+    } else if (result.formats && result.formats.length > 0) {
+      const mp4Format = result.formats.find(f => f.ext === 'mp4' && f.url);
+      if (mp4Format) {
+        streamUrl = mp4Format.url;
+      }
+    }
+
+    if (!streamUrl) {
+      throw new Error('Could not extract stream URL from yt-dlp');
+    }
+
+    // Extract dimensions (with intelligent defaults for shorts)
+    const width = result.width || (isShorts ? 360 : 1280);
+    const height = result.height || (isShorts ? 640 : 720);
+
+    const duration = Date.now() - startTime;
+    recordOperation('yt-dlp', duration, { videoId, type: isShorts ? 'shorts' : 'video', status: 'success' });
+    console.log(`[yt-dlp] Got stream URL and dimensions for ${videoId}: ${width}x${height} (${duration}ms)`);
+
+    return { streamUrl, width, height };
+
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    const errorDetail = error.stderr || error.message || 'Unknown error';
+    recordOperation('yt-dlp', duration, { videoId, status: 'error', error: errorDetail });
+    console.error(`[yt-dlp] FAILED for ${videoId} (${duration}ms):`);
+    console.error(`[yt-dlp]   message: ${error.message || '(empty)'}`);
+    if (error.stderr) console.error(`[yt-dlp]   stderr: ${error.stderr}`);
+    if (error.exitCode !== undefined) console.error(`[yt-dlp]   exitCode: ${error.exitCode}`);
+    throw error;
+  }
+}
+
+async function fetchStreamUrl(videoId, isShorts = false) {
+  try {
+    // Use Shorts URL for Shorts, watch URL for regular videos
+    const url = isShorts
+      ? `https://www.youtube.com/shorts/${videoId}`
+      : `https://www.youtube.com/watch?v=${videoId}`;
+    console.log(`[yt-dlp] Extracting stream for ${videoId} (${isShorts ? 'Shorts' : 'Video'})`);
+
+    const options = {
+      dumpJson: true, // Required: return parsed JSON (ADR-002)
+      format: '18',  // mp4 format (ADR-008)
+      quiet: true,
+      noProgress: true, // Don't show progress bar
+      jsRuntimes: 'node', // Required: JavaScript runtime for YouTube extraction (ADR-003)
+      remoteComponents: 'ejs:github', // Required: External JS solver for n-parameter challenge (ADR-001)
+    };
+
+    // Add cookies if available
+    if (COOKIES_FILE) {
+      console.log(`[yt-dlp] Using YouTube cookies: ${COOKIES_FILE}`);
+      console.log(`[yt-dlp] Cookies file exists: ${fs.existsSync(COOKIES_FILE)}`);
+      console.log(`[yt-dlp] Cookies file size: ${fs.existsSync(COOKIES_FILE) ? fs.statSync(COOKIES_FILE).size : 0} bytes`);
+      options.cookies = COOKIES_FILE;
+    } else {
+      console.log(`[yt-dlp] NO COOKIES - authentication will likely fail`);
+    }
+
+    console.log(`[yt-dlp] Format: ${options.format}`);
+    const result = await youtubeDlExec(url, options);
+
+    // Extract stream URL from yt-dlp output
+    let streamUrl = null;
+
+    if (result.url) {
+      streamUrl = result.url;
+    } else if (result.formats && result.formats.length > 0) {
+      // Find best mp4 format
+      const mp4Format = result.formats.find(f => f.ext === 'mp4' && f.url);
+      if (mp4Format) {
+        streamUrl = mp4Format.url;
+      }
+    }
+
+    if (!streamUrl) {
+      throw new Error('Could not extract stream URL from yt-dlp');
+    }
+
+    console.log(`[yt-dlp] Got stream URL for ${videoId}`);
+    return streamUrl;
+  } catch (error) {
+    console.error(`[yt-dlp] fetchStreamUrl FAILED for ${videoId}:`);
+    console.error(`[yt-dlp]   message: ${error.message || '(empty)'}`);
+    if (error.stderr) console.error(`[yt-dlp]   stderr: ${error.stderr}`);
+    if (error.exitCode !== undefined) console.error(`[yt-dlp]   exitCode: ${error.exitCode}`);
+    throw error;
+  }
+}
+
+// Resolve and cache stream URLs only when a proxy request needs one.
+async function getCachedOrFetch(videoId, isShorts = false) {
+  const startTime = Date.now();
+  const cacheKey = isShorts ? `${videoId}-shorts` : videoId;
+  if (cache.has(cacheKey)) {
+    const cached = cache.get(cacheKey);
+    if (Date.now() - cached.timestamp < CACHE_TTL) {
+      const duration = Date.now() - startTime;
+      recordOperation('cache-hit', duration, { videoId });
+      console.log(`[Cache] Hit for ${videoId} (${duration}ms)`);
+      return cached.data;
+    }
+    cache.delete(cacheKey);
+  }
+
+  if (pendingExtractions.has(cacheKey)) {
+    return pendingExtractions.get(cacheKey);
+  }
+
+  console.log(`[Cache] Miss for ${videoId}, extracting stream...`);
+  const extraction = getVideoInfo(videoId, isShorts)
+    .then((data) => {
+      cache.set(cacheKey, { data, timestamp: Date.now() });
+      recordOperation('cache-miss', Date.now() - startTime, { videoId });
+      return data;
+    })
+    .finally(() => pendingExtractions.delete(cacheKey));
+  pendingExtractions.set(cacheKey, extraction);
+  return extraction;
+}
+
+// Build HTML embed response
+function buildEmbedHtml(data, videoId, req) {
+  const { title, thumbnail, landscapeThumbnail, width, height, isShorts } = data;
+  const hasDimensions = Number.isInteger(width) && width > 0
+    && Number.isInteger(height) && height > 0;
+  const primaryImageDimensions = hasDimensions
+    ? `\n  <meta property="og:image:width" content="${width}">\n  <meta property="og:image:height" content="${height}">`
+    : '';
+  const videoDimensions = hasDimensions
+    ? `\n  <meta property="og:video:width" content="${width}">\n  <meta property="og:video:height" content="${height}">`
+    : '';
+  const twitterPlayerDimensions = hasDimensions
+    ? `\n  <meta name="twitter:player:width" content="${width}">\n  <meta name="twitter:player:height" content="${height}">`
+    : '';
+  const youtubeUrl = `https://www.youtube.com/${isShorts ? 'shorts/' : 'watch?v='}${videoId}`;
+
+  // Use proxy URL so Discord fetches video through our server (avoids Google IP-lock 403)
+  // Use BASE_URL env var if set, otherwise fall back to request host
+  const configuredBaseUrl = process.env.BASE_URL;
+  const baseUrl = configuredBaseUrl && /^https?:\/\//.test(configuredBaseUrl)
+    ? configuredBaseUrl.replace(/\/$/, '')
+    : `https://${req?.get('host') || 'localhost:3000'}`;
+  const proxyVideoUrl = `${baseUrl}/proxy/video/${videoId}${isShorts ? '?shorts=1' : ''}`;
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>${escapeHtml(title)}</title>
+
+  <!-- OpenGraph (Discord native embed support) -->
+  <meta property="og:type" content="video.other">
+  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:description" content="Watch on YouTube">
+  <meta property="og:url" content="${youtubeUrl}">
+  <meta property="og:site_name" content="YouTube">
+
+  <!-- Primary image dimensions describe the actual advertised image. -->
+  <meta property="og:image" content="${escapeHtml(thumbnail)}">${primaryImageDimensions}
+  <meta property="og:image:type" content="image/jpeg">
+  <meta property="og:image:alt" content="${escapeHtml(title)}">
+  ${landscapeThumbnail ? `\n  <meta property="og:image" content="${escapeHtml(landscapeThumbnail)}">\n  <meta property="og:image:width" content="1280">\n  <meta property="og:image:height" content="720">\n  <meta property="og:image:type" content="image/jpeg">` : ''}
+
+  <!-- Video metadata - matching actual dimensions -->
+  <meta property="og:video" content="${escapeHtml(proxyVideoUrl)}">
+  <meta property="og:video:url" content="${escapeHtml(proxyVideoUrl)}">
+  <meta property="og:video:secure_url" content="${escapeHtml(proxyVideoUrl)}">
+  <meta property="og:video:type" content="video/mp4">${videoDimensions}
+  <meta property="og:video:tag" content="video">
+
+  <!-- Twitter Card (Discord uses Twitter card metadata as fallback) -->
+  <meta name="twitter:card" content="player">
+  <meta name="twitter:site" content="@YouTube">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="Watch on YouTube">
+  <meta name="twitter:player" content="${youtubeUrl}">
+  <meta name="twitter:player:stream" content="${escapeHtml(proxyVideoUrl)}">
+  <meta name="twitter:player:stream:content_type" content="video/mp4">${twitterPlayerDimensions}
+  <meta name="twitter:image" content="${escapeHtml(thumbnail)}">
+  <meta name="twitter:image:alt" content="${escapeHtml(title)}">
+</head>
+<body>
+  <p>Redirecting to YouTube...</p>
+  <script>
+    window.location.replace('${youtubeUrl}');
+  </script>
+</body>
+</html>`;
+}
+
+async function sendEmbedResponse(req, res, videoId, isShorts = false) {
+  try {
+    const data = await fetchEmbedMetadata(videoId, isShorts);
+    const html = buildEmbedHtml(data, videoId, req);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(html);
+  } catch (error) {
+    console.error(`[Error] ${req.path} embed handler:`, error.message);
+    return res.status(500).json({ error: 'Failed to build embed metadata' });
+  }
+}
+
+// HTML escape helper
+function escapeHtml(text) {
+  const map = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;',
+  };
+  return text.replace(/[&<>"']/g, (m) => map[m]);
+}
+
+
+// ---- MH Stats live duels ---------------------------------------------------------
+// Two browsers agreeing on seven monsters and, at the end, on who won. Rooms live in
+// memory in mhstats-rooms.js and are swept after half an hour idle; nothing is persisted,
+// because a room is a conversation rather than a record.
+//
+// The server exists for exactly one reason: a browser cannot be trusted to hide the other
+// player's score, so the opponent's picks are never sent until both sides have finished.
+
+// Polling needs far more headroom than the 60/minute the public endpoints use: two players
+// each poll about every 1.5 seconds and send seven picks on top.
+const duelLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 240,
+  handler: (req, res) => res.status(429).json({ error: 'Too many duel requests. Slow down.' }),
+  keyGenerator: (req) => req.ip,
+});
+
+const duelJson = express.json({ limit: '4kb' });
+
+// Every route ends here, so a RoomError becomes its own status and anything else is a 500
+// that says nothing about the internals.
+function duelRoute(handler) {
+  return (req, res) => {
+    try {
+      res.json(handler(req));
+    } catch (err) {
+      if (err instanceof RoomError) return res.status(err.status).json({ error: err.message });
+      console.error('[mhstats] duel route failed:', err);
+      res.status(500).json({ error: 'duel room failure' });
+    }
+  };
+}
+
+app.post('/mhstats/api/rooms', duelLimiter, duelJson, duelRoute((req) => {
+  const { room, player } = duelRooms.create({
+    mask: req.body?.mask,
+    aim: req.body?.aim,
+    draw: req.body?.draw,
+  });
+  return duelRooms.view(room.code, player.id);
+}));
+
+app.post('/mhstats/api/rooms/:code/join', duelLimiter, duelJson, duelRoute((req) => {
+  const { room, player } = duelRooms.join(req.params.code);
+  return duelRooms.view(room.code, player.id);
+}));
+
+app.post('/mhstats/api/rooms/:code/pick', duelLimiter, duelJson, duelRoute((req) => {
+  const { you, stat } = req.body ?? {};
+  duelRooms.pick(req.params.code, you, stat);
+  return duelRooms.view(req.params.code, you);
+}));
+
+app.post('/mhstats/api/rooms/:code/reroll', duelLimiter, duelJson, duelRoute((req) => {
+  const { you } = req.body ?? {};
+  duelRooms.reroll(req.params.code, you);
+  return duelRooms.view(req.params.code, you);
+}));
+
+app.post('/mhstats/api/rooms/:code/again', duelLimiter, duelJson, duelRoute((req) => {
+  const { you } = req.body ?? {};
+  duelRooms.again(req.params.code, you);
+  return duelRooms.view(req.params.code, you);
+}));
+
+app.get('/mhstats/api/rooms/:code', duelLimiter, duelRoute((req) =>
+  duelRooms.view(req.params.code, req.query.you)));
+
+
+// ---- MH Stats quiz lobbies -------------------------------------------------------------
+// Up to eight players, ten questions, a host who starts it. State lives in mhstats-quiz.js,
+// in memory, swept when a lobby goes quiet.
+//
+// Same reason for existing as the duel rooms: the client is never sent the correct answer,
+// or anybody else's guess, until the question has closed. There is no way to hide a number
+// in a browser from the person holding the browser.
+
+// A quiz needs far more headroom than a duel. Eight players polling every 1.5 seconds is
+// about 320 requests a minute, and a household behind one NAT presents as a single IP, so
+// the duel's 240 would lock out a family playing together.
+const quizLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  handler: (req, res) => res.status(429).json({ error: 'Too many quiz requests. Slow down.' }),
+  keyGenerator: (req) => req.ip,
+});
+
+const quizJson = express.json({ limit: '4kb' });
+
+function quizRoute(handler) {
+  return (req, res) => {
+    try {
+      res.json(handler(req));
+    } catch (err) {
+      if (err instanceof QuizError) return res.status(err.status).json({ error: err.message });
+      console.error('[mhstats] quiz route failed:', err);
+      res.status(500).json({ error: 'quiz lobby failure' });
+    }
+  };
+}
+
+app.post('/mhstats/api/quiz', quizLimiter, quizJson, quizRoute((req) => {
+  const { room, player } = quizRooms.create({ cat: req.body?.cat, name: req.body?.name });
+  return quizRooms.view(room.code, player.id);
+}));
+
+app.post('/mhstats/api/quiz/:code/join', quizLimiter, quizJson, quizRoute((req) => {
+  const { room, player } = quizRooms.join(req.params.code, req.body?.name);
+  return quizRooms.view(room.code, player.id);
+}));
+
+app.post('/mhstats/api/quiz/:code/start', quizLimiter, quizJson, quizRoute((req) => {
+  const { you, cat } = req.body ?? {};
+  quizRooms.start(req.params.code, you, cat);
+  return quizRooms.view(req.params.code, you);
+}));
+
+// Abandon a quiz in progress and hand the lobby back, everyone still seated.
+app.post('/mhstats/api/quiz/:code/cancel', quizLimiter, quizJson, quizRoute((req) => {
+  const { you } = req.body ?? {};
+  quizRooms.cancel(req.params.code, you);
+  return quizRooms.view(req.params.code, you);
+}));
+
+app.post('/mhstats/api/quiz/:code/answer', quizLimiter, quizJson, quizRoute((req) => {
+  const { you, value } = req.body ?? {};
+  quizRooms.answer(req.params.code, you, value);
+  return quizRooms.view(req.params.code, you);
+}));
+
+app.post('/mhstats/api/quiz/:code/again', quizLimiter, quizJson, quizRoute((req) => {
+  const { you } = req.body ?? {};
+  quizRooms.again(req.params.code, you);
+  return quizRooms.view(req.params.code, you);
+}));
+
+app.get('/mhstats/api/quiz/:code', quizLimiter, quizRoute((req) =>
+  quizRooms.view(req.params.code, req.query.you)));
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  const uptime = process.uptime();
+  const cacheSize = cache.size;
+
+  res.json({
+    status: 'ok',
+    version: COMMIT_HASH,
+    uptime: Math.floor(uptime),
+    cache: { size: cacheSize, ttl_ms: CACHE_TTL },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// URL converter endpoint - accepts full YouTube URL and redirects to proxy
+app.get('/go', limiter, analyticsMiddleware, (req, res) => {
+  const youtubeUrl = req.query.url;
+
+  if (!youtubeUrl) {
+    return res.status(400).json({ error: 'Missing url parameter' });
+  }
+
+  // Extract video ID from various YouTube formats
+  let videoId = null;
+  let proxyPath = null;
+  let type = null;
+
+  // Match YouTube Shorts
+  if (youtubeUrl.includes('youtube.com/shorts/')) {
+    const match = youtubeUrl.match(/shorts\/([a-zA-Z0-9_-]+)/);
+    if (match) {
+      videoId = match[1];
+      proxyPath = `/shorts/${videoId}`;
+      type = 'shorts';
+    }
+  }
+  // Match standard YouTube watch URL
+  else if (youtubeUrl.includes('youtube.com/watch?v=') || youtubeUrl.includes('www.youtube.com/watch?v=')) {
+    const match = youtubeUrl.match(/v=([a-zA-Z0-9_-]+)/);
+    if (match) {
+      videoId = match[1];
+      proxyPath = `/watch?v=${videoId}`;
+      type = 'watch';
+    }
+  }
+  // Match youtu.be short URL
+  else if (youtubeUrl.includes('youtu.be/')) {
+    const match = youtubeUrl.match(/youtu\.be\/([a-zA-Z0-9_-]+)/);
+    if (match) {
+      videoId = match[1];
+      proxyPath = `/${videoId}`;
+      type = 'short-form';
+    }
+  }
+
+  if (!videoId || !proxyPath) {
+    return res.status(400).json({ error: 'Could not extract video ID from URL' });
+  }
+
+  // Set for analytics
+  req.videoId = videoId;
+  req.routeType = type;
+
+  console.log(`[go] Redirecting ${youtubeUrl} → ${proxyPath}`);
+  res.redirect(302, proxyPath);
+});
+
+// Watch handler (standard YouTube URLs)
+app.get('/watch', limiter, analyticsMiddleware, async (req, res) => {
+  const videoId = extractVideoId(req, 'watch');
+
+  if (!videoId) {
+    return res.status(400).json({ error: 'Invalid video ID' });
+  }
+
+  // Set for analytics
+  req.videoId = videoId;
+  req.routeType = 'watch';
+
+  if (isDiscordBot(req)) {
+    return sendEmbedResponse(req, res, videoId);
+  } else {
+    res.redirect(302, `https://www.youtube.com/watch?v=${videoId}`);
+  }
+});
+
+// Shorts handler
+app.get('/shorts/:id', limiter, analyticsMiddleware, async (req, res) => {
+  const videoId = extractVideoId(req, 'shorts');
+
+  if (!videoId) {
+    return res.status(400).json({ error: 'Invalid video ID' });
+  }
+
+  // Set for analytics
+  req.videoId = videoId;
+  req.routeType = 'shorts';
+
+  if (isDiscordBot(req)) {
+    return sendEmbedResponse(req, res, videoId, true);
+  } else {
+    res.redirect(302, `https://www.youtube.com/shorts/${videoId}`);
+  }
+});
+
+async function proxyVideo(req, res) {
+  const videoId = req.params.id;
+  const startTime = Date.now();
+  let proxyOutcome = null;
+
+  res.once('finish', () => {
+    if (proxyOutcome) {
+      recordOperation('proxy', Date.now() - startTime, { videoId, ...proxyOutcome });
+    }
+  });
+
+  if (!videoId || !/^[a-zA-Z0-9_-]+$/.test(videoId)) {
+    return res.status(400).json({ error: 'Invalid video ID' });
+  }
+
+  try {
+    const filePath = path.join(VIDEOS_DIR, `${videoId}.mp4`);
+    if (fs.existsSync(filePath)) {
+      proxyOutcome = { status: 'success', source: 'disk' };
+      res.sendFile(filePath); // Express handles Range and HEAD for completed files.
+      return;
+    }
+
+    const isShorts = req.query.shorts === '1';
+    const data = await getCachedOrFetch(videoId, isShorts);
+    const headers = {};
+    if (req.get('range')) headers.Range = req.get('range');
+    const upstream = await fetch(data.streamUrl, {
+      method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+      headers,
+    });
+
+    const rangeNotSatisfiable = upstream.status === 416;
+    if (!upstream.ok && !rangeNotSatisfiable) {
+      throw new Error(`Upstream returned ${upstream.status}`);
+    }
+
+    for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+      const value = upstream.headers.get(header);
+      if (value) res.setHeader(header, value);
+    }
+    res.status(upstream.status);
+
+    if (rangeNotSatisfiable) {
+      proxyOutcome = { status: 'range-not-satisfiable', source: 'upstream' };
+      if (req.method !== 'HEAD' && upstream.body) {
+        await pipeline(Readable.fromWeb(upstream.body), res);
+      } else {
+        res.end();
+      }
+      return;
+    }
+
+    if (req.method === 'HEAD') {
+      proxyOutcome = { status: 'success', source: 'upstream-head' };
+      res.end();
+      return;
+    }
+    if (!upstream.body) {
+      throw new Error('Upstream response has no body');
+    }
+
+    proxyOutcome = { status: 'success', source: 'upstream' };
+    await pipeline(Readable.fromWeb(upstream.body), res);
+  } catch (error) {
+    console.error(`[Proxy] Download failed for ${videoId}:`, error.message);
+    proxyOutcome = null;
+    recordOperation('proxy', Date.now() - startTime, {
+      videoId,
+      status: 'error',
+      error: error.message,
+    });
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Failed to download video' });
+    } else if (!res.destroyed) {
+      res.destroy(error);
+    }
+  }
+}
+
+// Register HEAD explicitly before GET so it never falls through Express's GET handling.
+app.head('/proxy/video/:id', limiter, proxyVideo);
+app.get('/proxy/video/:id', limiter, proxyVideo);
+
+// Root easter egg - rotating emoticons for human browsers
+app.get('/', (req, res) => {
+  const userAgent = req.get('user-agent') || '';
+  const isBot = userAgent.toLowerCase().includes('bot');
+  const protocol = req.protocol || 'https';
+  const host = req.get('host') || 'localhost:3000';
+  const baseUrl = `${protocol}://${host}`;
+
+  const facesJson = JSON.stringify(CUTE_EMOTICONS);
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ytfx - Cute Emoticons</title>
+
+  <!-- Discord Embed Metadata -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ytfx">
+  <meta property="og:description" content="You should not be here.">
+  <meta property="og:image" content="${baseUrl}/emoticons.gif">
+  <meta property="og:image:width" content="480">
+  <meta property="og:image:height" content="240">
+  <meta property="og:image:type" content="image/gif">
+  <meta property="og:url" content="${baseUrl}/">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="ytfx">
+  <meta name="twitter:description" content="You should not be here.">
+  <meta name="twitter:image" content="${baseUrl}/emoticons.gif">
+
+  <style>
+    body { background: #0d0d0d; color: #00ff41; font-family: 'Courier New', monospace; margin: 0; padding: 20px; }
+    pre { white-space: pre-wrap; word-wrap: break-word; }
+    .face { min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <pre><div class="face" id="face"></div>
+  You should not be here.</pre>
+  <script>
+    const faces = ${facesJson};
+    let currentIndex = 0;
+
+    function updateFace() {
+      document.getElementById('face').textContent = faces[currentIndex];
+      currentIndex = (currentIndex + 1) % faces.length;
+    }
+
+    updateFace();
+    setInterval(updateFace, 500);
+  </script>
+</body>
+</html>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+});
+
+// Performance metrics endpoint - no auth required (internal diagnostics)
+app.get('/metrics', (req, res) => {
+  const hours = parseInt(req.query.hours || '24', 10);
+  const metrics = getMetricsSummary(hours);
+  res.json(metrics);
+});
+
+// Detailed operation history endpoint - for debugging
+app.get('/metrics/history', (req, res) => {
+  const operation = req.query.operation || null;
+  const limit = parseInt(req.query.limit || '100', 10);
+  const history = getOperationHistory(operation, Math.min(limit, 500)); // Max 500 records
+  res.json({
+    filter: operation || 'all',
+    records: history.length,
+    data: history,
+  });
+});
+
+// Stats endpoint - requires STATS_TOKEN
+app.get('/stats', (req, res) => {
+  const STATS_TOKEN = process.env.STATS_TOKEN;
+
+  if (!STATS_TOKEN) {
+    return res.status(500).json({ error: 'Stats token not configured' });
+  }
+
+  // Get token from query or Authorization header
+  const queryToken = req.query.token;
+  const authToken = req.get('authorization')?.replace('Bearer ', '');
+  const providedToken = queryToken || authToken;
+
+  if (!providedToken || providedToken !== STATS_TOKEN) {
+    return res.status(401).json({ error: 'Invalid or missing stats token' });
+  }
+
+  const stats = getStats();
+  if (!stats) {
+    return res.status(500).json({ error: 'Failed to fetch statistics' });
+  }
+
+  res.json(stats);
+});
+
+// Short-form catch-all handler (youtu.be style URLs) - MUST BE LAST
+app.get('/:id', limiter, analyticsMiddleware, async (req, res) => {
+  const videoId = extractVideoId(req, 'short-form');
+
+  if (!videoId) {
+    return res.status(400).json({ error: 'Invalid video ID' });
+  }
+
+  // Set for analytics
+  req.videoId = videoId;
+  req.routeType = 'short-form';
+
+  if (isDiscordBot(req)) {
+    return sendEmbedResponse(req, res, videoId);
+  } else {
+    res.redirect(302, `https://www.youtube.com/watch?v=${videoId}`);
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Start server and cleanup only if this is the entry point
+if (process.argv[1] === new URL(import.meta.url).pathname) {
+  (async () => {
+    // Initialize database
+    await initDb();
+
+    setInterval(() => {
+      const now = Date.now();
+      for (const [key, value] of cache.entries()) {
+        if (now - value.timestamp > CACHE_TTL) {
+          cache.delete(key);
+        }
+      }
+      console.log(`[Cache] Cleaned up expired entries. Current size: ${cache.size}`);
+    }, CLEANUP_INTERVAL);
+
+    // 48h file cleanup job
+    const FILE_TTL = 48 * 60 * 60 * 1000; // 48 hours
+    setInterval(() => {
+      try {
+        const files = fs.readdirSync(VIDEOS_DIR);
+        const now = Date.now();
+        for (const file of files) {
+          const fp = path.join(VIDEOS_DIR, file);
+          const { mtimeMs } = fs.statSync(fp);
+          if (now - mtimeMs > FILE_TTL) {
+            fs.unlinkSync(fp);
+            console.log(`[Cleanup] Deleted old video: ${file}`);
+          }
+        }
+      } catch (e) {
+        console.error('[Cleanup] Error during file cleanup:', e.message);
+      }
+    }, 60 * 60 * 1000); // run every hour
+
+    app.listen(PORT, () => {
+      console.log(`[Server] ytfx listening on http://localhost:${PORT}`);
+    });
+  })();
+}
+
+// Parse semicolon-separated cookie string to Netscape format (exported for testing)
+function parseCookieString(cookieStr) {
+  const cookieHeader = `# Netscape HTTP Cookie File\n# This is a generated file!  Do not edit.\n\n`;
+  const cookieLines = cookieStr.split(';')
+    .map(c => c.trim())
+    .filter(c => c)
+    .map(c => {
+      const eqIndex = c.indexOf('=');
+      if (eqIndex === -1) return null;
+      const name = c.substring(0, eqIndex).trim();
+      const value = c.substring(eqIndex + 1);
+      const isSecure = name.startsWith('__Secure-') || ['YSC', 'SSID', 'SAPISID', 'PREF', 'SOCS', 'VISITOR_PRIVACY_METADATA', 'VISITOR_INFO1_LIVE', 'LOGIN_INFO'].includes(name);
+      return `.youtube.com\tTRUE\t/\t${isSecure ? 'TRUE' : 'FALSE'}\t0\t${name}\t${value}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+  return cookieHeader + cookieLines;
+}
+
+// Export functions for testing
+export { app, isDiscordBot, extractVideoId, escapeHtml, buildEmbedHtml, cache, CACHE_TTL, parseCookieString };

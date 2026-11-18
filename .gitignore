@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+cookies.txt
+*.db
+tests/coverage/
+*.pyc
+__pycache__/
+generate-emoticon-gif.js
+.serena/

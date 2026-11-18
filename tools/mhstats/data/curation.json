@@ -1,0 +1,224 @@
+[
+  {
+    "id": "ashen-lao-shan-lung",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: siege monster with no status rows in any source; cannot be afflicted"
+  },
+  {
+    "id": "baleful-gigginox",
+    "stat": "hp",
+    "value": 170,
+    "reason": "3 Ultimate publishes no base HP in any source; the subspecies, tougher than the base Gigginox"
+  },
+  {
+    "id": "ceadeus",
+    "stat": "hp",
+    "value": 270,
+    "reason": "3 Ultimate publishes no base HP in any source; a siege elder fought across multiple underwater areas over a long hunt"
+  },
+  {
+    "id": "ceadeus",
+    "stat": "siz",
+    "value": 276,
+    "reason": "fixed-size monster with no crown data; a whale-like elder fought across several underwater areas"
+  },
+  {
+    "id": "ceadeus",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: underwater siege elder; 3U records no status tolerances for it"
+  },
+  {
+    "id": "crimson-qurupeco",
+    "stat": "hp",
+    "value": 145,
+    "reason": "3 Ultimate publishes no base HP in any source; the subspecies, a step above the base bird wyvern"
+  },
+  {
+    "id": "dah-ren-mohran",
+    "stat": "siz",
+    "value": 282,
+    "reason": "fixed-size monster with no crown data; a sand whale fought from the deck of a ship, slightly below Jhen"
+  },
+  {
+    "id": "dah-ren-mohran",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: 4U records a tolerance of 0 for every status, meaning immune"
+  },
+  {
+    "id": "dalamadur",
+    "stat": "siz",
+    "value": 300,
+    "reason": "fixed-size monster with no crown data; the longest monster in the series, measured in the thousands of centimetres"
+  },
+  {
+    "id": "dalamadur",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: 4U records a tolerance of 0 for every status, meaning immune"
+  },
+  {
+    "id": "dire-miralis",
+    "stat": "hp",
+    "value": 292,
+    "reason": "3 Ultimate publishes no base HP in any source; the 3 Ultimate final boss, a volcano-scale elder dragon"
+  },
+  {
+    "id": "dire-miralis",
+    "stat": "siz",
+    "value": 280,
+    "reason": "fixed-size monster with no crown data; a volcano-sized siege elder dragon"
+  },
+  {
+    "id": "dire-miralis",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: siege elder dragon; 3U records no status tolerances for it"
+  },
+  {
+    "id": "gigginox",
+    "stat": "hp",
+    "value": 150,
+    "reason": "3 Ultimate publishes no base HP in any source; a mid-tier 3U flying wyvern, comparable to its generation peers"
+  },
+  {
+    "id": "gobul",
+    "stat": "hp",
+    "value": 145,
+    "reason": "3 Ultimate publishes no base HP in any source; a mid-tier ambush leviathan"
+  },
+  {
+    "id": "gobul",
+    "stat": "wil",
+    "value": 150,
+    "reason": "mid-tier 3U monster whose tolerance table is blank; placed with its 3U peers"
+  },
+  {
+    "id": "goldbeard-ceadeus",
+    "stat": "hp",
+    "value": 285,
+    "reason": "3 Ultimate publishes no base HP in any source; the elder form of an already siege-scale whale"
+  },
+  {
+    "id": "goldbeard-ceadeus",
+    "stat": "siz",
+    "value": 278,
+    "reason": "fixed-size monster with no crown data; the older, larger form of an already whale-sized elder"
+  },
+  {
+    "id": "goldbeard-ceadeus",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: underwater siege elder; 3U records no status tolerances for it"
+  },
+  {
+    "id": "hallowed-jhen-mohran",
+    "stat": "hp",
+    "value": 290,
+    "reason": "3 Ultimate publishes no base HP in any source; the subspecies of a siege monster, tougher than the base"
+  },
+  {
+    "id": "hallowed-jhen-mohran",
+    "stat": "siz",
+    "value": 288,
+    "reason": "fixed-size monster with no crown data; a sand whale large enough to be fought from a ship"
+  },
+  {
+    "id": "hallowed-jhen-mohran",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: 3U lists every status as 無効 (no effect)"
+  },
+  {
+    "id": "jhen-mohran",
+    "stat": "hp",
+    "value": 280,
+    "reason": "3 Ultimate publishes no base HP in any source; a siege monster fought from a ship, with a health pool to match"
+  },
+  {
+    "id": "jhen-mohran",
+    "stat": "siz",
+    "value": 288,
+    "reason": "fixed-size monster with no crown data; a sand whale large enough to be fought from a ship"
+  },
+  {
+    "id": "jhen-mohran",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: 3U lists every status as 無効 (no effect)"
+  },
+  {
+    "id": "king-shakalaka",
+    "stat": "siz",
+    "value": 6,
+    "reason": "fixed-size monster with no crown data; a Shakalaka: among the smallest large monsters in the series"
+  },
+  {
+    "id": "lao-shan-lung",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: siege monster with no status rows in any source; cannot be afflicted"
+  },
+  {
+    "id": "purple-ludroth",
+    "stat": "hp",
+    "value": 140,
+    "reason": "3 Ultimate publishes no base HP in any source; a mid-tier leviathan subspecies"
+  },
+  {
+    "id": "qurupeco",
+    "stat": "hp",
+    "value": 120,
+    "reason": "3 Ultimate publishes no base HP in any source; an early-game bird wyvern, among the weaker monsters of its generation"
+  },
+  {
+    "id": "shah-dalamadur",
+    "stat": "siz",
+    "value": 300,
+    "reason": "fixed-size monster with no crown data; the elder form of the longest monster in the series"
+  },
+  {
+    "id": "shah-dalamadur",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: 4U records a tolerance of 0 for every status, meaning immune"
+  },
+  {
+    "id": "shen-gaoren",
+    "stat": "siz",
+    "value": 266,
+    "reason": "fixed-size monster with no crown data; a castle-sized carapaceon that wears a fortress as a shell"
+  },
+  {
+    "id": "shen-gaoren",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: siege monster with no status rows in any source; cannot be afflicted"
+  },
+  {
+    "id": "vespoid-queen",
+    "stat": "siz",
+    "value": 34,
+    "reason": "fixed-size monster with no crown data; an oversized insect, small even among low-rank monsters"
+  },
+  {
+    "id": "yama-tsukami",
+    "stat": "siz",
+    "value": 254,
+    "reason": "fixed-size monster with no crown data; a floating whale-sized elder that carries a forest on its back"
+  },
+  {
+    "id": "yama-tsukami",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: siege monster with no status rows in any source; cannot be afflicted"
+  },
+  {
+    "id": "zorah-magdaros",
+    "stat": "wil",
+    "value": 298,
+    "reason": "immune to status: every status cell is blank in World data: it cannot be poisoned, paralysed, slept or stunned"
+  }
+]
